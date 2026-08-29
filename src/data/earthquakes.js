@@ -25,7 +25,10 @@ import {
  * already cover every discrete mutation this layer makes.
  */
 
-const API_URL = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson';
+// Proxied through /api/earthquakes so stale cache handles USGS transient errors (502s).
+// Falls back to direct USGS URL if the proxy itself fails.
+const API_URL = '/api/earthquakes';
+const API_URL_DIRECT = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson';
 
 export const EARTHQUAKE_OVERLAY_SOURCE_ID = 'earthquakes';
 export const EARTHQUAKE_OVERLAY_COHORT_LIMIT = 96;
@@ -164,7 +167,12 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
 
   async update(viewer) {
     try {
-      const response = await fetch(API_URL);
+      let response = await fetch(API_URL);
+      // If proxy fails, fall back to direct USGS fetch
+      if (!response.ok && response.status >= 500) {
+        console.warn(`[Data:Earthquakes] Proxy returned ${response.status}, trying direct USGS`);
+        response = await fetch(API_URL_DIRECT);
+      }
       if (!response.ok) {
         _lastError = `USGS HTTP ${response.status}`;
         console.warn(`[Data:Earthquakes] API returned ${response.status}`);
