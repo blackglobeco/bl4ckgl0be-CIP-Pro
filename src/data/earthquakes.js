@@ -220,6 +220,10 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
             // outline is NOT supported on CLAMP_TO_GROUND ellipses in Cesium —
             // enabling it triggers "Entity geometry outlines are unsupported on
             // terrain" warnings and has no visual effect. Disabled here.
+            // Cesium requires `height` to be explicitly defined alongside
+            // heightReference, otherwise it ignores heightReference and emits
+            // "heightReference will be ignored" in the console.
+            height: 0,
             outline: false,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
