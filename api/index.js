@@ -135,8 +135,13 @@ async function handleOpenSky(req, res) {
 
   let osErr = null;
   try {
-    // No AbortSignal on main OpenSky fetch - matches original vite.config (relies on maxDuration: 60)
-    const r = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers });
+    // On Vercel, cloud IPs are often blocked by OpenSky anon tier.
+    // Use a 15s timeout so we detect the block quickly and fall back to adsb.lol
+    // rather than waiting the full 60s function duration.
+    const r = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+      headers,
+      signal: mkAbort(15_000).signal,
+    });
     const body = await r.text();
 
     if (r.status === 429) {
@@ -431,12 +436,24 @@ async function fetchOverpass(query) {
 async function handleOverpass(req, res) {
   if (req.method !== 'POST') return sj(res, 405, { error: 'POST only' });
   const body = await readBody(req, 8192); if (!body) return sj(res, 400, { error: 'empty or oversized query' });
-  const query = body.trim();
-  const cacheKey = query.replace(/\s+/g, ' ');
+
+  // Client sends body as: data=<url-encoded-ql>  (matches traffic.js: `data=${encodeURIComponent(query)}`)
+  // Extract the raw QL from the form-encoded body, then fetchOverpass re-encodes it correctly.
+  let rawQuery;
+  try {
+    const params = new URLSearchParams(body);
+    rawQuery = params.get('data');
+  } catch { rawQuery = null; }
+  // Fall back to treating the whole body as raw QL (e.g. plain-text POST)
+  if (!rawQuery || !rawQuery.trim()) rawQuery = body;
+  rawQuery = rawQuery.trim();
+  if (!rawQuery) return sj(res, 400, { error: 'empty Overpass query' });
+
+  const cacheKey = rawQuery.replace(/\s+/g, ' ');
   const now = Date.now(), cached = _overpassCache.get(cacheKey);
   if (cached && now - cached.at < 5 * 60_000) { res.setHeader('Cache-Control', 'public, max-age=300'); return sr(res, 200, cached.body, cached.ct); }
   try {
-    const result = await fetchOverpass(query);
+    const result = await fetchOverpass(rawQuery);
     if (result.status < 400) { _overpassCache.set(cacheKey, { at: now, body: result.body, ct: result.contentType }); if (_overpassCache.size > 100) _overpassCache.delete(_overpassCache.keys().next().value); }
     res.setHeader('Cache-Control', 'public, max-age=300');
     return sr(res, result.status, result.body, result.contentType);
