@@ -189,25 +189,69 @@ async function handleOpenSkyTrack(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADSBDB
+// ADSBDB — matches original adsbdbProxy() exactly
+// Routes: /api/adsbdb/type/:hex  and  /api/adsbdb/route/:callsign
+// Response: { found: true, ...data } or { found: false }
 // ─────────────────────────────────────────────────────────────────────────────
-const _adsbdb = { routes: new Map(), aircraft: new Map() };
+const _adsbdbCache = { routes: new Map(), aircraft: new Map() };
+const _adsbdbInflight = new Map();
+const ADSBDB_TTL = 24 * 3600_000;
+
+function parseAdsbdbRoute(json) {
+  const fr = json?.response?.flightroute;
+  if (!fr?.origin || !fr?.destination) return null;
+  const airport = a => ({ code: a.iata_code || a.icao_code || '', name: a.municipality || a.name || '', lat: Number.isFinite(a.latitude) ? a.latitude : null, lon: Number.isFinite(a.longitude) ? a.longitude : null });
+  return { airline: fr.airline?.name || null, origin: airport(fr.origin), destination: airport(fr.destination) };
+}
+function parseAdsbdbAircraft(json) {
+  const a = json?.response?.aircraft;
+  if (!a) return null;
+  return { typeCode: a.icao_type || null, typeName: a.manufacturer && a.type ? `${a.manufacturer} ${a.type}` : (a.type || null), registration: a.registration || null };
+}
+
+async function adsbdbLookup(kind, key) {
+  const store = kind === 'route' ? _adsbdbCache.routes : _adsbdbCache.aircraft;
+  const entry = store.get(key);
+  if (entry && Date.now() - entry.at < ADSBDB_TTL) return entry.data;
+  const ik = `${kind}:${key}`;
+  if (!_adsbdbInflight.has(ik)) {
+    _adsbdbInflight.set(ik, (async () => {
+      try {
+        const url = kind === 'route' ? `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(key)}` : `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(key)}`;
+        const r = await fetch(url, { signal: mkAbort(8_000).signal });
+        if (r.ok) {
+          const data = kind === 'route' ? parseAdsbdbRoute(await r.json()) : parseAdsbdbAircraft(await r.json());
+          store.set(key, { at: Date.now(), data }); return data;
+        }
+        if (r.status === 404) { store.set(key, { at: Date.now(), data: null }); return null; }
+        // other statuses: don't cache, retry later
+        return store.get(key)?.data ?? null;
+      } catch { return store.get(key)?.data ?? null; }
+      finally { _adsbdbInflight.delete(ik); }
+    })());
+  }
+  return _adsbdbInflight.get(ik);
+}
+
 async function handleAdsbdb(req, res) {
-  const url = qurl(req); const kind = url.searchParams.get('kind'), key = (url.searchParams.get('key') || '').trim();
-  if (!['route', 'aircraft'].includes(kind) || !key) return sj(res, 400, { error: 'kind and key required' });
-  const store = kind === 'route' ? _adsbdb.routes : _adsbdb.aircraft;
-  const now = Date.now(), entry = store.get(key);
-  if (entry && now - entry.at < 24 * 3600_000) return sj(res, 200, { data: entry.data });
-  try {
-    const upUrl = kind === 'route' ? `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(key)}` : `https://api.adsbdb.com/v0/aircraft/${encodeURIComponent(key)}`;
-    const r = await fetch(upUrl, { signal: mkAbort(8_000).signal });
-    if (r.status === 404) { store.set(key, { at: now, data: null }); return sj(res, 200, { data: null }); }
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json(); let data = null;
-    if (kind === 'route') { const fr = j?.response?.flightroute; if (fr?.origin && fr?.destination) { const ap = a => ({ code: a.iata_code || a.icao_code || '', name: a.municipality || a.name || '', lat: a.latitude ?? null, lon: a.longitude ?? null }); data = { airline: fr.airline?.name || null, origin: ap(fr.origin), destination: ap(fr.destination) }; } }
-    else { const a = j?.response?.aircraft; if (a) data = { typeCode: a.icao_type || null, typeName: a.manufacturer && a.type ? `${a.manufacturer} ${a.type}` : (a.type || null), registration: a.registration || null }; }
-    store.set(key, { at: now, data }); return sj(res, 200, { data });
-  } catch (err) { return sj(res, 502, { error: err.message }); }
+  // Path: /api/adsbdb/type/:hex  or  /api/adsbdb/route/:callsign
+  const urlPath = (req.url || '').split('?')[0];
+  const parts = urlPath.replace(/^\/api\/adsbdb\/?/, '').split('/');
+  const [kind, rawKey] = parts;
+
+  if (kind === 'route') {
+    const cs = String(rawKey || '').toUpperCase();
+    if (!/^[A-Z0-9]{2,8}$/.test(cs)) return sj(res, 400, { error: 'invalid callsign' });
+    const data = await adsbdbLookup('route', cs);
+    return sj(res, 200, data ? { found: true, ...data } : { found: false });
+  }
+  if (kind === 'type') {
+    const hex = String(rawKey || '').toLowerCase();
+    if (!/^[0-9a-f]{6}$/.test(hex)) return sj(res, 400, { error: 'invalid hex' });
+    const data = await adsbdbLookup('aircraft', hex);
+    return sj(res, 200, data ? { found: true, ...data } : { found: false });
+  }
+  return sj(res, 404, { error: 'unknown endpoint' });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -481,22 +525,79 @@ async function handleMilitaryInstallations(req, res) {
 const FIRMS_SOURCES = ['VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'VIIRS_SNPP_NRT'];
 let _firmsCache = null, _firmsInflight = null;
 
+// parseFirmsCsv matches src/data/firmsCsv.js exactly — returns records with
+// the field names adaptFirmsRecords() expects: lat, lon, frp, confidence,
+// brightness, daynight, acqDate, acqTime, satellite, instrument
+function isLikelyCsv(text) {
+  if (typeof text !== 'string') return false;
+  const trimmed = text.trimStart();
+  if (!trimmed || trimmed[0] === '<') return false;
+  const headerLine = trimmed.slice(0, trimmed.indexOf('\n') === -1 ? undefined : trimmed.indexOf('\n')).trim().toLowerCase();
+  const fields = headerLine.split(',').map(f => f.trim());
+  return ['latitude', 'longitude', 'acq_date', 'acq_time', 'confidence', 'frp'].every(f => fields.includes(f));
+}
+
 function parseFirmsCsv(text) {
-  if (!text?.includes(',')) return null;
-  const lines = text.trim().split('\n'); if (lines.length < 2) return [];
-  const h = lines[0].split(',');
-  const li = h.indexOf('latitude'), oi = h.indexOf('longitude'), di = h.indexOf('acq_date'), ti = h.indexOf('acq_time');
-  if (li < 0 || oi < 0) return null;
-  return lines.slice(1).map(l => { const p = l.split(','); return { latitude: parseFloat(p[li]), longitude: parseFloat(p[oi]), acq_date: p[di] || '', acq_time: p[ti] || '' }; }).filter(f => Number.isFinite(f.latitude) && Number.isFinite(f.longitude));
+  if (!isLikelyCsv(text)) return null;
+  const lines = text.split('\n');
+  let headerIndex = 0;
+  while (headerIndex < lines.length && !lines[headerIndex].trim()) headerIndex++;
+  const header = lines[headerIndex].trim().toLowerCase().split(',').map(f => f.trim());
+  const col = new Map(header.map((name, i) => [name, i]));
+  const iLat = col.get('latitude'), iLon = col.get('longitude');
+  const iFrp = col.get('frp'), iConf = col.get('confidence');
+  const iBright = col.get('bright_ti4') ?? col.get('brightness');
+  const iDaynight = col.get('daynight');
+  const iAcqDate = col.get('acq_date'), iAcqTime = col.get('acq_time');
+  const iSat = col.get('satellite'), iInstr = col.get('instrument');
+  const cell = (parts, i) => (i === undefined || parts[i] === undefined) ? '' : parts[i].trim();
+  const fOrZero = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  const records = [];
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i].trim(); if (!line) continue;
+    const parts = line.split(','); if (parts.length < header.length) continue;
+    const lat = Number(parts[iLat]), lon = Number(parts[iLon]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    records.push({
+      lat, lon,
+      frp: fOrZero(parts[iFrp]),
+      confidence: cell(parts, iConf),   // raw: 'l'/'n'/'h' or 0-100 — client normalizes
+      brightness: fOrZero(parts[iBright]),
+      daynight: cell(parts, iDaynight),
+      acqDate: cell(parts, iAcqDate),   // camelCase matches adaptFirmsRecords
+      acqTime: cell(parts, iAcqTime),   // NOT zero-padded — kept verbatim
+      satellite: cell(parts, iSat),
+      instrument: cell(parts, iInstr),
+    });
+  }
+  return records;
 }
-function filterFirms24h(fires, now = Date.now()) {
-  const cutoff = now - 24 * 3600_000;
-  return fires.filter(f => { try { const t = (f.acq_time?.toString() || '0000').padStart(4, '0'); return new Date(`${f.acq_date}T${t.slice(0, 2)}:${t.slice(2)}:00Z`).getTime() > cutoff; } catch { return false; } });
+
+function filterFirms24h(records, nowMs) {
+  if (!Array.isArray(records)) return [];
+  const oldest = nowMs - 24 * 3600_000, newest = nowMs + 2 * 3600_000;
+  const memo = new Map();
+  return records.filter(r => {
+    const key = `${r.acqDate}:${r.acqTime}`;
+    let ms = memo.get(key);
+    if (ms === undefined) {
+      // acquisitionMsUtc from firmsCsv.js
+      const d = r.acqDate, t = String(r.acqTime ?? '').trim();
+      if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && /^\d{1,4}$/.test(t)) {
+        const hhmm = t.padStart(4, '0');
+        ms = Date.UTC(Number(d.slice(0,4)), Number(d.slice(5,7))-1, Number(d.slice(8,10)), Number(hhmm.slice(0,2)), Number(hhmm.slice(2,4)));
+      } else { ms = NaN; }
+      memo.set(key, ms);
+    }
+    return Number.isFinite(ms) && ms >= oldest && ms <= newest;
+  });
 }
+
 function buildFirmsPayload(entry, stale) {
   const fires = filterFirms24h(entry.fires, Date.now());
   return { fetchedAt: entry.at, stale, ttlMs: 30 * 60_000, sources: entry.sources, count: fires.length, fires };
 }
+
 async function refreshFirms(mapKey) {
   const now = Date.now(); const sources = [], fires = [];
   for (const source of FIRMS_SOURCES) { // sequential — quota courtesy (matches original)
@@ -505,8 +606,9 @@ async function refreshFirms(mapKey) {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const records = parseFirmsCsv(await r.text());
       if (!records) throw new Error('non-CSV response');
-      sources.push({ source, count: filterFirms24h(records, now).length, ok: true }); fires.push(...filterFirms24h(records, now));
-    } catch { sources.push({ source, count: 0, ok: false }); }
+      const filtered = filterFirms24h(records, now);
+      sources.push({ source, count: filtered.length, ok: true }); fires.push(...filtered);
+    } catch (err) { console.warn('[firms]', source, err.message); sources.push({ source, count: 0, ok: false }); }
   }
   if (!sources.some(s => s.ok)) throw new Error('all FIRMS sources failed');
   return { at: now, sources, fires };
@@ -935,7 +1037,7 @@ export default async function handler(req, res) {
   if (path === '/api/earthquakes')            return handleEarthquakes(req, res);
   if (path === '/api/opensky')                return handleOpenSky(req, res);
   if (path === '/api/opensky-track')          return handleOpenSkyTrack(req, res);
-  if (path === '/api/adsbdb')                 return handleAdsbdb(req, res);
+  if (path.startsWith('/api/adsbdb'))          return handleAdsbdb(req, res);
   if (path === '/api/adsblol/mil')            return handleAdsbLolMil(req, res);
   if (path === '/api/adsblol/trace')          return handleAdsbLolTrace(req, res);
   if (path.startsWith('/api/celestrak/'))     return handleCelestrak(req, res);
