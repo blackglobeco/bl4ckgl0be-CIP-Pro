@@ -1,6 +1,8 @@
 /**
  * api/index.js — Single Vercel serverless function for all /api/* routes.
- * vercel.json: { "rewrites": [{ "source": "/api/:path*", "destination": "/api/index" }] }
+ * vercel.json rewrites /api/:path* → /api/index (maxDuration: 60)
+ *
+ * Rebuilt from original vite.config.js + src/data/ source files.
  */
 
 'use strict';
@@ -19,15 +21,84 @@ async function readBody(req, max = 64 * 1024) {
   for await (const c of req) { n += c.length; if (n > max) return null; chunks.push(c); }
   return Buffer.concat(chunks).toString('utf8');
 }
+// mkAbort: create AbortController with auto-abort after ms
 function mkAbort(ms) { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c; }
 function escXml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function hashSeed(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; } return h; }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OPENSKY
+// OPENSKY + ADSB.LOL FALLBACK
+// Matches original vite.config.js openSkyProxy() + adsbLolFallback.js exactly
 // ─────────────────────────────────────────────────────────────────────────────
 let _osCache = null, _osCacheAt = 0, _osCooldown = 0;
 let _osToken = null, _osTokenExp = 0, _osTokenProm = null;
+
+// adsb.lol point cache – mirrors original _adsbLolPointCache (Map, keyed by rounded lat/lon)
+const _adsbLolPointCache = new Map();
+const ADSBLOL_RADIUS_NM = 250; // matches vite.config ADSBLOL_POINT_RADIUS_NM
+const ADSBLOL_CACHE_MS = 15_000;
+
+// Exact copy of normalizeAdsbLolAircraftState from src/data/adsbLolFallback.js
+const KNOT_TO_MPS = 0.514444, FOOT_TO_M = 0.3048, FPM_TO_MPS = 0.00508;
+function finiteNum(value) { if (value === null || value === undefined || value === '') return null; const n = Number(value); return Number.isFinite(n) ? n : null; }
+function emitterCategory(value) { const m = { A1:2,A2:3,A3:4,A4:5,A5:6,A6:7,A7:8,B1:9,B2:10,B3:11,B4:12,B6:14,B7:15 }; return m[String(value||'').trim().toUpperCase()] || 0; }
+function normalizeAdsbLolAircraftState(aircraft, nowSeconds) {
+  const hex = String(aircraft?.hex || '').trim().toLowerCase();
+  const latitude = finiteNum(aircraft?.lat);
+  const longitude = finiteNum(aircraft?.lon);
+  if (!hex || latitude === null || longitude === null) return null;
+  const seenPosition = Math.max(0, finiteNum(aircraft?.seen_pos) ?? finiteNum(aircraft?.seen) ?? 0);
+  const seen = Math.max(0, finiteNum(aircraft?.seen) ?? seenPosition);
+  const onGround = aircraft?.alt_baro === 'ground';
+  const barometricFeet = onGround ? null : finiteNum(aircraft?.alt_baro);
+  const geometricFeet = finiteNum(aircraft?.alt_geom);
+  const groundSpeedKnots = finiteNum(aircraft?.gs);
+  const verticalRateFpm = finiteNum(aircraft?.baro_rate) ?? finiteNum(aircraft?.geom_rate);
+  const track = finiteNum(aircraft?.track);
+  return [
+    hex,
+    String(aircraft?.flight || aircraft?.r || '').trim() || null,
+    null,
+    Math.max(0, nowSeconds - seenPosition),
+    Math.max(0, nowSeconds - seen),
+    longitude, latitude,
+    barometricFeet === null ? null : barometricFeet * FOOT_TO_M,
+    onGround,
+    groundSpeedKnots === null ? null : groundSpeedKnots * KNOT_TO_MPS,
+    track,
+    verticalRateFpm === null ? null : verticalRateFpm * FPM_TO_MPS,
+    null,
+    geometricFeet === null ? null : geometricFeet * FOOT_TO_M,
+    aircraft?.squawk || null,
+    aircraft?.spi === 1,
+    0,
+    emitterCategory(aircraft?.category),
+  ];
+}
+function normalizeAdsbLolPointResponse(payload) {
+  const responseNow = finiteNum(payload?.now);
+  const nowSeconds = responseNow === null ? Math.floor(Date.now() / 1000) : Math.floor(responseNow > 10_000_000_000 ? responseNow / 1000 : responseNow);
+  const states = (Array.isArray(payload?.ac) ? payload.ac : []).map(ac => normalizeAdsbLolAircraftState(ac, nowSeconds)).filter(Boolean);
+  return { time: nowSeconds, states };
+}
+
+async function fetchAdsbLolFallback(lat, lon) {
+  const rLat = Math.round(lat * 4) / 4, rLon = Math.round(lon * 4) / 4;
+  const cacheKey = `${rLat.toFixed(2)},${rLon.toFixed(2)}`;
+  const now = Date.now(), cached = _adsbLolPointCache.get(cacheKey);
+  if (cached && now - cached.at < ADSBLOL_CACHE_MS) return cached.body;
+  const r = await fetch(`https://api.adsb.lol/v2/lat/${rLat}/lon/${rLon}/dist/${ADSBLOL_RADIUS_NM}`, {
+    headers: { Accept: 'application/json', 'User-Agent': 'gods-eye-view-adsblol-regional-fallback/1.0' },
+    signal: mkAbort(10_000).signal,
+  });
+  if (!r.ok) throw new Error(`adsb.lol HTTP ${r.status}`);
+  const payload = await r.json();
+  const normalized = normalizeAdsbLolPointResponse(payload);
+  const body = JSON.stringify(normalized);
+  if (_adsbLolPointCache.size > 50) _adsbLolPointCache.delete(_adsbLolPointCache.keys().next().value);
+  _adsbLolPointCache.set(cacheKey, { at: now, body });
+  return body;
+}
 
 async function getOSToken() {
   const now = Date.now();
@@ -37,8 +108,9 @@ async function getOSToken() {
   if (!cid || !cs) return null;
   _osTokenProm = (async () => {
     try {
+      // No timeout on token fetch - matches original
       const r = await fetch('https://auth.opensky-network.org/realms/opensky-network/protocol/openid-connect/token',
-        { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'client_credentials', client_id: cid, client_secret: cs }), signal: mkAbort(10_000).signal });
+        { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'client_credentials', client_id: cid, client_secret: cs }) });
       if (!r.ok) return null;
       const d = await r.json(); _osToken = d.access_token || null; _osTokenExp = now + (d.expires_in || 3600) * 1000; return _osToken;
     } catch { return null; } finally { _osTokenProm = null; }
@@ -49,8 +121,9 @@ async function getOSToken() {
 async function handleOpenSky(req, res) {
   const now = Date.now();
   if (_osCache && (now - _osCacheAt < 15_000 || now < _osCooldown)) return sr(res, 200, _osCache, 'application/json');
+
   const mode = String(process.env.OPENSKY_AUTH_MODE || 'anon').toLowerCase().trim();
-  const headers = { Accept: 'application/json', 'User-Agent': 'gods-eye-view-opensky-proxy/1.0' };
+  const headers = { Accept: 'application/json' }; // original has no User-Agent on main call
   if (mode === 'oauth' || mode === 'auto') {
     const tok = await getOSToken();
     if (tok) headers.Authorization = `Bearer ${tok}`;
@@ -59,30 +132,58 @@ async function handleOpenSky(req, res) {
     const u = process.env.OPENSKY_USERNAME, p = process.env.OPENSKY_PASSWORD;
     if (u && p) headers.Authorization = `Basic ${b64(`${u}:${p}`)}`;
   }
+
+  let osErr = null;
   try {
-    const r = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers, signal: mkAbort(28_000).signal });
+    // No AbortSignal on main OpenSky fetch - matches original vite.config (relies on maxDuration: 60)
+    const r = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers });
     const body = await r.text();
-    if (r.status === 429) { _osCooldown = now + 120_000; if (_osCache) return sr(res, 200, _osCache, 'application/json'); return sj(res, 429, { error: 'OpenSky rate limited' }); }
-    if (r.ok) { _osCache = body; _osCacheAt = now; _osCooldown = 0; }
-    return sr(res, r.status, body, 'application/json');
-  } catch (err) {
-    console.error('[opensky]', err.message);
-    if (_osCache) return sr(res, 200, _osCache, 'application/json');
-    return sj(res, 502, { error: 'OpenSky proxy error' });
+
+    if (r.status === 429) {
+      _osCooldown = now + 120_000;
+      if (_osCache) return sr(res, 200, _osCache, 'application/json');
+      osErr = 'rate_limited';
+    } else if (r.ok) {
+      _osCache = body; _osCacheAt = now; _osCooldown = 0;
+      return sr(res, 200, body, 'application/json');
+    } else {
+      osErr = `HTTP ${r.status}`;
+    }
+  } catch (e) {
+    osErr = e.message;
+    console.error('[OpenSky Proxy]', e.message);
   }
+
+  // Stale cache first (matches original catch block)
+  if (_osCache) return sr(res, 200, _osCache, 'application/json');
+
+  // adsb.lol regional fallback (matches original serveAdsbLolPointFallback)
+  const url = qurl(req);
+  const lat = Number(url.searchParams.get('lat'));
+  const lon = Number(url.searchParams.get('lon'));
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    try {
+      const fallbackBody = await fetchAdsbLolFallback(lat, lon);
+      res.setHeader('X-Flight-Source', 'adsb.lol');
+      res.setHeader('X-Flight-Coverage', `${ADSBLOL_RADIUS_NM}nm regional fallback`);
+      return sr(res, 200, fallbackBody, 'application/json');
+    } catch (fbErr) { console.error('[OpenSky adsb.lol fallback]', fbErr.message); }
+  }
+
+  return sj(res, 502, { error: 'OpenSky proxy error' });
 }
 
 async function handleOpenSkyTrack(req, res) {
   const url = qurl(req); const icao24 = url.searchParams.get('icao24');
   if (!icao24) return sj(res, 400, { error: 'icao24 required' });
-  const headers = { Accept: 'application/json', 'User-Agent': 'gods-eye-view/1.0' };
+  const headers = { Accept: 'application/json' };
   const cid = process.env.OPENSKY_CLIENT_ID, cs = process.env.OPENSKY_CLIENT_SECRET;
   if (cid && cs) headers.Authorization = `Basic ${b64(`${cid}:${cs}`)}`;
   try {
     const u = new URL('https://opensky-network.org/api/tracks/all');
     u.searchParams.set('icao24', icao24);
     const begin = url.searchParams.get('begin'); if (begin) u.searchParams.set('time', begin);
-    const r = await fetch(u.toString(), { headers, signal: mkAbort(15_000).signal });
+    const r = await fetch(u.toString(), { headers });
     return sr(res, r.status, await r.text(), 'application/json');
   } catch (err) { return sj(res, 502, { error: err.message }); }
 }
@@ -110,7 +211,7 @@ async function handleAdsbdb(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADSB.LOL
+// ADSB.LOL military + trace
 // ─────────────────────────────────────────────────────────────────────────────
 let _milCache = null, _milAt = 0;
 async function handleAdsbLolMil(req, res) {
@@ -132,14 +233,14 @@ async function handleAdsbLolTrace(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CELESTRAK — gp.php?GROUP=&FORMAT=tle (NOT /pub/TLE/ — returns 403)
+// CELESTRAK — gp.php?GROUP=&FORMAT=tle
 // ─────────────────────────────────────────────────────────────────────────────
 const _tleCache = new Map();
 async function handleCelestrak(req, res) {
   const group = (req.url || '').replace(/.*\/celestrak\//, '').split('?')[0];
   if (!group || !/^[a-z0-9-]+$/i.test(group)) return res.status(400).send('invalid group');
   const now = Date.now(), entry = _tleCache.get(group);
-  if (entry && now - entry.at < 6 * 3600_000) { res.setHeader('Content-Type', 'text/plain'); res.setHeader('x-tle-cache', 'HIT'); return res.status(200).send(entry.body); }
+  if (entry && now - entry.at < 6 * 3600_000) { res.setHeader('Content-Type', 'text/plain'); return res.status(200).send(entry.body); }
   try {
     const url = new URL('https://celestrak.org/NORAD/elements/gp.php');
     url.searchParams.set('GROUP', group); url.searchParams.set('FORMAT', 'tle');
@@ -148,17 +249,15 @@ async function handleCelestrak(req, res) {
     const body = await r.text();
     if (!/^1 /m.test(body)) throw new Error('no TLE lines in response');
     _tleCache.set(group, { at: now, body });
-    res.setHeader('Content-Type', 'text/plain'); res.setHeader('x-tle-cache', 'MISS');
-    return res.status(200).send(body);
+    res.setHeader('Content-Type', 'text/plain'); return res.status(200).send(body);
   } catch (err) {
-    console.error('[celestrak]', group, err.message);
-    if (entry) { res.setHeader('Content-Type', 'text/plain'); res.setHeader('x-tle-cache', 'STALE-ERR'); return res.status(200).send(entry.body); }
+    if (entry) { res.setHeader('Content-Type', 'text/plain'); return res.status(200).send(entry.body); }
     return res.status(502).send(`CelesTrak error: ${err.message}`);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LAUNCHES
+// LAUNCHES (Launch Library 2)
 // ─────────────────────────────────────────────────────────────────────────────
 let _launchCache = null, _launchAt = 0;
 async function handleLaunches(req, res) {
@@ -217,7 +316,6 @@ async function handleRealtimeToken(req, res) {
     return res.status(r.status).send(body);
   } catch (err) { return sj(res, 502, { error: err.message }); }
 }
-
 async function handleRealtimeDebugLog(req, res) {
   try { const record = JSON.parse((await readBody(req)) || '{}'); console.log('[realtime-debug]', JSON.stringify({ loggedAt: new Date().toISOString(), ...record })); } catch {}
   return res.status(204).end();
@@ -261,7 +359,7 @@ async function handleTextSearch(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OVERPASS — Fixed: User-Agent header + multiple mirrors + raw body (not encoded)
+// OVERPASS — 4 mirrors + User-Agent (original OVERPASS_UPSTREAMS list)
 // ─────────────────────────────────────────────────────────────────────────────
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
@@ -269,32 +367,22 @@ const OVERPASS_MIRRORS = [
   'https://lz4.overpass-api.de/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
 ];
+const _overpassCache = new Map();
 
-async function fetchOverpass(query, timeoutMs = 30_000) {
+async function fetchOverpass(query) {
   let lastErr;
   for (const endpoint of OVERPASS_MIRRORS) {
     try {
-      const r = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'gods-eye-view-overpass-proxy/1.0',
-        },
-        body: `data=${encodeURIComponent(query)}`,
-        signal: mkAbort(timeoutMs).signal,
-      });
+      const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'gods-eye-view-overpass-proxy/1.0' }, body: `data=${encodeURIComponent(query)}`, signal: mkAbort(30_000).signal });
       if (r.status === 429) { lastErr = new Error(`rate limited on ${endpoint}`); continue; }
       if (r.status >= 500) { lastErr = new Error(`HTTP ${r.status} on ${endpoint}`); continue; }
       const body = await r.text();
-      // Skip HTML error pages (406, runtime errors)
       if (body.trim().startsWith('<!')) { lastErr = new Error(`HTML error from ${endpoint}`); continue; }
       return { status: r.status, body, contentType: r.headers.get('content-type') || 'application/json' };
     } catch (err) { lastErr = err; }
   }
   throw lastErr || new Error('all Overpass mirrors failed');
 }
-
-const _overpassCache = new Map();
 
 async function handleOverpass(req, res) {
   if (req.method !== 'POST') return sj(res, 405, { error: 'POST only' });
@@ -309,7 +397,7 @@ async function handleOverpass(req, res) {
     res.setHeader('Cache-Control', 'public, max-age=300');
     return sr(res, result.status, result.body, result.contentType);
   } catch (err) {
-    if (cached) { res.setHeader('Cache-Control', 'no-store'); return sr(res, 200, cached.body, cached.ct); }
+    if (cached) return sr(res, 200, cached.body, cached.ct);
     return sj(res, 502, { error: `Overpass proxy error: ${err.message}` });
   }
 }
@@ -331,7 +419,8 @@ async function handleRoute(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TERRAIN HEIGHTS — GET to terrain.reearth.land/heights.json?points=lon,lat;...
+// TERRAIN HEIGHTS — GET terrain.reearth.land/heights.json?points=lon,lat;...
+// From original: terrainHeightsProxy.js + vite.config terrainHeightsProxy()
 // ─────────────────────────────────────────────────────────────────────────────
 const _terrainCache = new Map();
 async function handleTerrainHeights(req, res) {
@@ -345,8 +434,7 @@ async function handleTerrainHeights(req, res) {
   const now = Date.now(), entry = _terrainCache.get(canonKey);
   if (entry && now - entry.at < 30 * 24 * 3600_000) return sj(res, 200, entry.data);
   try {
-    const upUrl = `https://terrain.reearth.land/heights.json?points=${encodeURIComponent(canonKey)}`;
-    const r = await fetch(upUrl, { signal: mkAbort(30_000).signal });
+    const r = await fetch(`https://terrain.reearth.land/heights.json?points=${encodeURIComponent(canonKey)}`, { signal: mkAbort(30_000).signal });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     if (!Array.isArray(data?.results)) throw new Error('malformed upstream response');
@@ -357,7 +445,7 @@ async function handleTerrainHeights(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MILITARY INSTALLATIONS — Fixed: uses fetchOverpass helper (with mirrors + User-Agent)
+// MILITARY INSTALLATIONS — uses fetchOverpass helper
 // ─────────────────────────────────────────────────────────────────────────────
 const _milInstCache = new Map();
 async function handleMilitaryInstallations(req, res) {
@@ -374,23 +462,21 @@ async function handleMilitaryInstallations(req, res) {
   if (cached && now - cached.at < 3600_000) { res.setHeader('Cache-Control', 'public, max-age=60'); return sj(res, 200, { ...cached.payload, status: 'cached' }); }
   try {
     const query = `[out:json][timeout:25];\n(\n  way["landuse"="military"](${box.south},${box.west},${box.north},${box.east});\n  relation["landuse"="military"](${box.south},${box.west},${box.north},${box.east});\n);\nout center tags;`;
-    const result = await fetchOverpass(query, 35_000);
+    const result = await fetchOverpass(query);
     const data = JSON.parse(result.body);
-    const retrievedAt = new Date().toISOString();
-    const payload = { status: 'ready', elements: data.elements || [], retrievedAt, fetchedAt: now, source: 'OpenStreetMap' };
+    const payload = { status: 'ready', elements: data.elements || [], retrievedAt: new Date().toISOString(), fetchedAt: now, source: 'OpenStreetMap' };
     _milInstCache.set(key, { at: now, payload });
     if (_milInstCache.size > 200) _milInstCache.delete(_milInstCache.keys().next().value);
     res.setHeader('Cache-Control', 'public, max-age=60');
     return sj(res, 200, payload);
   } catch (err) {
-    console.error('[military-installations]', err.message);
     if (cached) return sj(res, 200, { ...cached.payload, status: 'stale' });
     return sj(res, 503, { error: 'Mapped installation context is temporarily unavailable' });
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FIRMS — Fixed: sequential fetches (quota courtesy), /status sub-route
+// FIRMS — sequential fetches (quota courtesy per original), with /status route
 // ─────────────────────────────────────────────────────────────────────────────
 const FIRMS_SOURCES = ['VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'VIIRS_SNPP_NRT'];
 let _firmsCache = null, _firmsInflight = null;
@@ -411,45 +497,32 @@ function buildFirmsPayload(entry, stale) {
   const fires = filterFirms24h(entry.fires, Date.now());
   return { fetchedAt: entry.at, stale, ttlMs: 30 * 60_000, sources: entry.sources, count: fires.length, fires };
 }
-
 async function refreshFirms(mapKey) {
   const now = Date.now(); const sources = [], fires = [];
-  for (const source of FIRMS_SOURCES) {
+  for (const source of FIRMS_SOURCES) { // sequential — quota courtesy (matches original)
     try {
-      // Sequential — never in parallel (quota courtesy per original vite.config)
       const r = await fetch(`https://firms.modaps.eosdis.nasa.gov/api/area/csv/${encodeURIComponent(mapKey)}/${source}/world/2`, { signal: mkAbort(60_000).signal });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const records = parseFirmsCsv(await r.text());
       if (!records) throw new Error('non-CSV response');
-      const filtered = filterFirms24h(records, now);
-      sources.push({ source, count: filtered.length, ok: true }); fires.push(...filtered);
-    } catch (err) { sources.push({ source, count: 0, ok: false }); }
+      sources.push({ source, count: filterFirms24h(records, now).length, ok: true }); fires.push(...filterFirms24h(records, now));
+    } catch { sources.push({ source, count: 0, ok: false }); }
   }
   if (!sources.some(s => s.ok)) throw new Error('all FIRMS sources failed');
   return { at: now, sources, fires };
 }
-
 async function handleFirms(req, res) {
   const path = (req.url || '').split('?')[0];
   const mapKey = String(process.env.FIRMS_MAP_KEY || '').trim();
-
-  // /api/firms/status
   if (path.endsWith('/status') || path.includes('/firms/status')) {
     if (!mapKey) return sj(res, 200, { hasKey: false, lastFetch: null, count: null, stale: false, ttlMs: 30 * 60_000, transactions: null });
     return sj(res, 200, { hasKey: true, lastFetch: _firmsCache?.at || null, count: _firmsCache?.fires?.length || null, stale: _firmsCache ? Date.now() - _firmsCache.at >= 30 * 60_000 : false, ttlMs: 30 * 60_000, transactions: null });
   }
-
   if (!mapKey) return sj(res, 503, { error: 'no_key' });
-
-  const now = Date.now();
   const entry = _firmsCache;
-  if (entry && now - entry.at < 30 * 60_000) return sj(res, 200, buildFirmsPayload(entry, false));
-
+  if (entry && Date.now() - entry.at < 30 * 60_000) return sj(res, 200, buildFirmsPayload(entry, false));
   if (!_firmsInflight) {
-    _firmsInflight = refreshFirms(mapKey)
-      .then(fresh => { _firmsCache = fresh; return fresh; })
-      .catch(err => { console.warn('[firms] refresh failed:', err.message); return null; })
-      .finally(() => { _firmsInflight = null; });
+    _firmsInflight = refreshFirms(mapKey).then(fresh => { _firmsCache = fresh; return fresh; }).catch(err => { console.warn('[firms]', err.message); return null; }).finally(() => { _firmsInflight = null; });
   }
   const fresh = await _firmsInflight;
   if (fresh) return sj(res, 200, buildFirmsPayload(fresh, false));
@@ -458,11 +531,10 @@ async function handleFirms(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REGIONAL BRIEF + WEATHER EFFECTS
+// REGIONAL BRIEF + WEATHER EFFECTS (Open-Meteo + Nominatim)
 // ─────────────────────────────────────────────────────────────────────────────
 const _briefCache = new Map(), _wxCache = new Map();
 function ck(lat, lon) { return `${(Math.round(lat * 10) / 10).toFixed(1)},${(Math.round(lon * 10) / 10).toFixed(1)}`; }
-
 async function handleRegionalBrief(req, res) {
   const url = qurl(req); const latitude = Number(url.searchParams.get('latitude')), longitude = Number(url.searchParams.get('longitude'));
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return sj(res, 400, { error: 'latitude and longitude required' });
@@ -482,7 +554,6 @@ async function handleRegionalBrief(req, res) {
     return sj(res, 200, payload);
   } catch { if (cached) return sj(res, 200, { ...cached.payload, status: 'stale' }); return sj(res, 503, { error: 'regional brief unavailable' }); }
 }
-
 async function handleWeatherEffects(req, res) {
   const url = qurl(req); const latitude = Number(url.searchParams.get('latitude')), longitude = Number(url.searchParams.get('longitude'));
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return sj(res, 400, { error: 'latitude and longitude required' });
@@ -503,17 +574,14 @@ async function handleWeatherEffects(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TOMTOM — Fixed: correct URL flow/relative/ (not flow/relative0/)
+// TOMTOM — flow/relative/ (NOT relative0)
 // ─────────────────────────────────────────────────────────────────────────────
 const _tileCache = new Map(); let _dailyCount = 0, _dailyDate = '';
 function tomtomBudget() { return Number(process.env.TOMTOM_DAILY_TILE_BUDGET) || 40000; }
 function tomtomOk() { const d = new Date().toISOString().slice(0, 10); if (_dailyDate !== d) { _dailyDate = d; _dailyCount = 0; } return _dailyCount < tomtomBudget(); }
-
 async function handleTomtom(req, res) {
   const urlPath = (req.url || '').split('?')[0];
-  if (/\/tomtom\/status$/.test(urlPath) || urlPath.endsWith('/status')) {
-    return sj(res, 200, { hasKey: Boolean(process.env.TOMTOM_API_KEY), dailyCount: _dailyCount, budget: tomtomBudget() });
-  }
+  if (/\/tomtom\/status$/.test(urlPath) || urlPath.endsWith('/status')) return sj(res, 200, { hasKey: Boolean(process.env.TOMTOM_API_KEY), dailyCount: _dailyCount, budget: tomtomBudget() });
   const m = urlPath.match(/\/flow\/(\d+)\/(\d+)\/(\d+)\.pbf$/);
   if (!m) return sj(res, 404, { error: 'not_found' });
   const [, z, x, y] = m;
@@ -522,10 +590,8 @@ async function handleTomtom(req, res) {
   if (entry && now - entry.at < 120_000) return sr(res, 200, entry.buf, 'application/x-protobuf');
   if (!tomtomOk()) { if (entry) return sr(res, 200, entry.buf, 'application/x-protobuf'); return sj(res, 429, { error: 'budget exhausted' }); }
   try {
-    // Fixed URL: flow/relative/ (not flow/relative0/)
-    const tileUrl = `https://api.tomtom.com/traffic/map/4/tile/flow/relative/${z}/${x}/${y}.pbf?key=${encodeURIComponent(process.env.TOMTOM_API_KEY)}`;
-    const r = await fetch(tileUrl, { signal: mkAbort(10_000).signal });
-    if (!r.ok) return sj(res, r.status === 401 || r.status === 403 ? r.status : 502, { error: `TomTom upstream error (HTTP ${r.status})` });
+    const r = await fetch(`https://api.tomtom.com/traffic/map/4/tile/flow/relative/${z}/${x}/${y}.pbf?key=${encodeURIComponent(process.env.TOMTOM_API_KEY)}`, { signal: mkAbort(10_000).signal });
+    if (!r.ok) return sj(res, r.status === 401 || r.status === 403 ? r.status : 502, { error: `TomTom HTTP ${r.status}` });
     const buf = Buffer.from(await r.arrayBuffer());
     if (buf.length === 0) throw new Error('empty tile body');
     _tileCache.set(tileKey, { at: now, buf }); _dailyCount++;
@@ -534,7 +600,7 @@ async function handleTomtom(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AIS LIVE
+// AIS LIVE (degraded — WebSocket not supported in Vercel serverless)
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleAisLive(req, res) {
   const hasKey = Boolean(process.env.AISSTREAM_API_KEY);
@@ -544,7 +610,7 @@ async function handleAisLive(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CCTV
+// CCTV — /sources /health /stream/:id /frame/:id /media/:id
 // ─────────────────────────────────────────────────────────────────────────────
 const _cctvHealth = new Map(); let _cctvSrcs = null, _cctvSrcsAt = 0;
 function buildSvgFrame({ cameraId, label, city, status }) {
@@ -572,8 +638,7 @@ async function handleCctv(req, res) {
     if (sub === 'health') { res.setHeader('Cache-Control', 'no-store'); return sj(res, 200, { cameras: Array.from(_cctvHealth.values()) }); }
     if (sub.startsWith('stream/')) { const cameraId = decodeURIComponent(sub.replace('stream/', '').trim()); const source = sourceById.get(cameraId); res.setHeader('Cache-Control', 'no-store'); return sj(res, 200, { id: cameraId, feedType: source?.feedType || 'image', mediaUrl: null, frameUrl: `/api/cctv/frame/${encodeURIComponent(cameraId)}`, provider: source?.provider || '', sourceKind: source?.sourceKind || 'fallback' }); }
     if (sub.startsWith('frame/')) {
-      const cameraId = decodeURIComponent(sub.replace('frame/', '').trim());
-      const source = sourceById.get(cameraId);
+      const cameraId = decodeURIComponent(sub.replace('frame/', '').trim()); const source = sourceById.get(cameraId);
       const label = url.searchParams.get('label') || source?.name || cameraId;
       const city = url.searchParams.get('city') || source?.city || '';
       const lat = Number(url.searchParams.get('lat') ?? source?.lat);
@@ -603,7 +668,7 @@ async function handleCctv(req, res) {
       res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-CCTV-Source', 'synthetic');
       return sr(res, 200, buildSvgFrame({ cameraId, label, city, status: 'NO UPSTREAM CONFIGURED' }), 'image/svg+xml');
     }
-    if (sub.startsWith('media/')) { res.setHeader('Cache-Control', 'no-store'); return sj(res, 404, { error: 'No media URL configured for this camera' }); }
+    if (sub.startsWith('media/')) return sj(res, 404, { error: 'No media URL configured for this camera' });
     return sj(res, 404, { error: `Unknown CCTV route: ${sub}` });
   } catch (err) { console.error('[cctv]', err.message); return sj(res, 500, { error: 'CCTV proxy error' }); }
 }
@@ -611,7 +676,7 @@ async function handleCctv(req, res) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GBFS
 // ─────────────────────────────────────────────────────────────────────────────
-const GBFS_HOSTS = new Set(['gbfs.lyft.com', 'gbfs.baywheels.com', 'gbfs.capitalbikeshare.com', 'gbfs.citibikenyc.com', 'gbfs.divvybikes.com', 'gbfs.bluebikes.com', 'data.lime.bike']);
+const GBFS_HOSTS = new Set(['gbfs.lyft.com','gbfs.baywheels.com','gbfs.capitalbikeshare.com','gbfs.citibikenyc.com','gbfs.divvybikes.com','gbfs.bluebikes.com','data.lime.bike']);
 async function handleGbfs(req, res) {
   const encoded = (req.url || '').replace(/.*\/gbfs\//, '');
   let upstreamUrl; try { upstreamUrl = new URL(decodeURIComponent(encoded)); } catch { return sj(res, 400, { error: 'invalid URL' }); }
@@ -627,11 +692,30 @@ async function handleGbfs(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RADIO — Fixed: acceptedGeneration + catalogInstance required by radio.js
+// RADIO — rebuilt from original vite.config.js createRadioProxyMiddleware()
+//
+// Key fixes from source:
+// - 3-concurrent query fetching (mapRadioConcurrent with concurrency=3)
+// - Limit 750 stations (RADIO_DIRECTORY_LIMIT)
+// - Country code: empty string '' when not a valid ISO alpha-2 (not raw value)
+// - coverage object in response
+// - acceptedGeneration: null when degraded (matches original exactly)
+// - RADIO_FALLBACK_MIRRORS: de1, de2, nl1
+// - Dynamic mirror discovery from all.api.radio-browser.info/json/servers
 // ─────────────────────────────────────────────────────────────────────────────
 const RADIO_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-let _radioCatalog = null, _radioAt = 0, _radioGen = 0;
-const _radioCatalogInstance = randomUUID(); // stable per process (matches vite.config behaviour)
+const RADIO_DIRECTORY_LIMIT = 750;
+const RADIO_CATALOG_MIN_SUCCESSFUL_QUERIES = 5;
+const RADIO_CATALOG_HEALTHY_MIN_STATIONS = Math.ceil(RADIO_DIRECTORY_LIMIT / 2);
+const RADIO_DIRECTORY_CACHE_MS = 45 * 60_000;
+const RADIO_DIRECTORY_STALE_MS = 7 * 24 * 3600_000;
+const RADIO_FALLBACK_MIRRORS = ['https://de1.api.radio-browser.info', 'https://de2.api.radio-browser.info', 'https://nl1.api.radio-browser.info'];
+const _radioCatalogInstance = randomUUID(); // stable per process
+let _radioCatalog = null, _radioRefreshPromise = null, _radioGen = 0;
+let _radioMirrors = [...RADIO_FALLBACK_MIRRORS], _radioMirrorsAt = 0;
+
+// ISO 3166-1 alpha-2 set (subset covering most Radio Browser entries)
+const ISO_A2 = new Set('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW'.split(' '));
 
 function cleanRadioText(value, maxLength) { return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLength).trim(); }
 function publicRadioHttpsUrl(value) {
@@ -643,22 +727,20 @@ function publicRadioHttpsUrl(value) {
   } catch { return null; }
 }
 
-function normalizeStation(raw) {
+// Matches original normalizeRadioBrowserStation exactly
+function normalizeRadioBrowserStation(raw) {
   const id = cleanRadioText(raw?.stationuuid, 40).toLowerCase();
-  if (!RADIO_UUID_RE.test(id)) return null;
-  if (Number(raw?.lastcheckok) !== 1) return null;
-  if (Number(raw?.hls) === 1) return null;
   const lat = raw?.geo_lat === null || raw?.geo_lat === '' ? null : Number(raw?.geo_lat);
   const lon = raw?.geo_long === null || raw?.geo_long === '' ? null : Number(raw?.geo_long);
-  if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) return null;
   const codec = cleanRadioText(raw?.codec, 16).toUpperCase();
-  if (!/^(?:MP3|AAC(?:\+|-LC|-HE)?|HE-AAC)$/i.test(codec)) return null;
   const streamUrl = publicRadioHttpsUrl(raw?.url_resolved || raw?.url);
-  if (!streamUrl) return null;
+  if (!RADIO_UUID_RE.test(id) || Number(raw?.lastcheckok) !== 1 || Number(raw?.hls) === 1 || !Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180 || !/^(?:MP3|AAC(?:\+|-LC|-HE)?|HE-AAC)$/i.test(codec) || !streamUrl) return null;
   const name = cleanRadioText(raw?.name, 140); if (!name) return null;
   const tags = String(raw?.tags ?? '').split(',').map(t => cleanRadioText(t, 80).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean).filter((t, i, a) => a.indexOf(t) === i).slice(0, 24);
   const languages = String(raw?.language ?? '').split(',').map(l => cleanRadioText(l, 40)).filter(Boolean).slice(0, 8);
-  const countryCode = cleanRadioText(raw?.countrycode, 2).toUpperCase();
+  // Country code: use ISO alpha-2 if valid, else '' (matches original normalizeRadioCountryInput behavior)
+  const rawCode = cleanRadioText(raw?.countrycode, 2).toUpperCase();
+  const countryCode = ISO_A2.has(rawCode) ? rawCode : '';
   const bitrate = Number(raw?.bitrate);
   return {
     id, name, lat, lon, streamUrl,
@@ -674,10 +756,28 @@ function normalizeStation(raw) {
   };
 }
 
+// Dynamic mirror discovery (matches original mirrors() function)
+async function getRadioMirrors() {
+  const now = Date.now();
+  if (now - _radioMirrorsAt < 6 * 3600_000) return _radioMirrors;
+  try {
+    const r = await fetch('https://all.api.radio-browser.info/json/servers', { headers: { 'User-Agent': 'gods-eye-view/1.0', Accept: 'application/json' }, signal: mkAbort(10_000).signal });
+    if (r.ok) {
+      const rows = await r.json();
+      const discovered = [...new Set((Array.isArray(rows) ? rows : []).map(row => {
+        const h = String(row?.name || '').toLowerCase().replace(/\.$/, '');
+        return /^[a-z0-9-]+\.api\.radio-browser\.info$/.test(h) ? `https://${h}` : null;
+      }).filter(Boolean))];
+      if (discovered.length) { _radioMirrors = [...discovered, ...RADIO_FALLBACK_MIRRORS.filter(o => !discovered.includes(o))]; }
+    }
+  } catch { /* keep existing mirrors */ }
+  _radioMirrorsAt = now;
+  return _radioMirrors;
+}
+
 async function fetchRadioPath(pathname) {
-  const origins = ['https://de1.api.radio-browser.info', 'https://nl1.api.radio-browser.info', 'https://at1.api.radio-browser.info'];
-  let lastErr;
-  for (const origin of origins) {
+  const mirrors = await getRadioMirrors(); let lastErr;
+  for (const origin of mirrors) {
     try {
       const r = await fetch(`${origin}${pathname}`, { headers: { 'User-Agent': 'gods-eye-view/1.0', Accept: 'application/json' }, signal: mkAbort(15_000).signal });
       if (!r.ok) throw new Error(`HTTP ${r.status}`); return await r.json();
@@ -686,36 +786,76 @@ async function fetchRadioPath(pathname) {
   throw lastErr || new Error('No Radio Browser mirror available');
 }
 
-async function buildRadioCatalog() {
-  const queries = [null, 'news', 'talk', 'weather', 'emergency', 'scanner', 'aviation', 'marine', 'traffic'];
-  const results = await Promise.allSettled(queries.map(async (tag) => {
-    const params = new URLSearchParams({ has_geo_info: 'true', is_https: 'true', hidebroken: 'true', order: 'clickcount', reverse: 'true', limit: tag ? '220' : '1800' });
-    if (tag) params.set('tag', tag);
-    try { const rows = await fetchRadioPath(`/json/stations/search?${params}`); return Array.isArray(rows) ? rows : []; }
-    catch { return []; }
-  }));
-  const seen = new Set(), selected = [];
-  // Specialist queries first, then popularity fill (mirrors vite.config ordering)
-  for (const result of results.slice(1)) { if (result.status === 'fulfilled') { for (const raw of result.value.slice(0, 45)) { const s = normalizeStation(raw); if (s && !seen.has(s.id)) { seen.add(s.id); selected.push(s); if (selected.length >= 2000) break; } } } }
-  if (results[0].status === 'fulfilled') {
-    const sorted = [...results[0].value].sort((a, b) => (Number(b.clickcount) || 0) - (Number(a.clickcount) || 0));
-    for (const raw of sorted) { const s = normalizeStation(raw); if (s && !seen.has(s.id)) { seen.add(s.id); selected.push(s); if (selected.length >= 2000) break; } }
-  }
-  const stations = selected.map(s => ({ id: s.id, name: s.name, lat: s.lat, lon: s.lon, streamUrl: s.streamUrl, homepage: s.homepage, tags: s.tags, languages: s.languages, state: s.state, country: s.country, countryCode: s.countryCode, metadataTrust: s.metadataTrust, codec: s.codec, bitrate: s.bitrate }));
-  return { stations, updatedAt: new Date().toISOString(), stale: false, degraded: false, degradedReason: null, acceptedGeneration: ++_radioGen, catalogInstance: _radioCatalogInstance };
+// mapRadioConcurrent — exact copy from vite.config.js (concurrency=3)
+async function mapRadioConcurrent(values, concurrency, mapper) {
+  const results = new Array(values.length); let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) { const index = cursor++; if (index >= values.length) return; results[index] = await mapper(values[index], index); }
+  });
+  await Promise.all(workers); return results;
 }
 
-let _radioRefreshPromise = null;
+async function refreshRadioCatalog() {
+  const queries = [null, 'news', 'talk', 'weather', 'emergency', 'scanner', 'aviation', 'marine', 'traffic'];
+  const outcomes = await mapRadioConcurrent(queries, 3, async (tag, index) => {
+    const params = new URLSearchParams({ has_geo_info: 'true', is_https: 'true', hidebroken: 'true', order: 'clickcount', reverse: 'true', limit: index === 0 ? '1800' : '220' });
+    if (tag) params.set('tag', tag);
+    try {
+      const rows = await fetchRadioPath(`/json/stations/search?${params}`);
+      if (!Array.isArray(rows)) throw new Error('not an array');
+      const stations = rows.map(normalizeRadioBrowserStation).filter(Boolean);
+      const requestedTag = tag ? cleanRadioText(tag, 80).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim() : null;
+      const requestedTagCovered = !requestedTag || stations.some(s => s.tags.some(t => t === requestedTag || t.includes(requestedTag)));
+      return { succeeded: stations.length > 0 && requestedTagCovered, stations };
+    } catch { return { succeeded: false, stations: [] }; }
+  });
+
+  // Selection: seed specialist tags first, then popularity fill (matches original)
+  const selected = [], seen = new Set();
+  const take = station => { if (!station || seen.has(station.id) || selected.length >= RADIO_DIRECTORY_LIMIT) return; seen.add(station.id); selected.push(station); };
+  for (const outcome of outcomes.slice(1)) outcome.stations.slice(0, 45).forEach(take);
+  [...outcomes.flatMap(o => o.stations)].sort((a, b) => b.clickCount - a.clickCount || a.name.localeCompare(b.name)).forEach(take);
+
+  const successfulQueries = outcomes.filter(o => o.succeeded).length;
+  const broadQueryHealthy = outcomes[0].succeeded && outcomes[0].stations.length > 0;
+  const healthReasons = [];
+  if (!broadQueryHealthy) healthReasons.push('broad-query-unhealthy');
+  if (successfulQueries < RADIO_CATALOG_MIN_SUCCESSFUL_QUERIES) healthReasons.push('query-coverage-below-policy');
+  if (selected.length < RADIO_CATALOG_HEALTHY_MIN_STATIONS) healthReasons.push('station-coverage-below-policy');
+  const degraded = healthReasons.length > 0;
+  const coverage = { successfulQueries, totalQueries: queries.length, stationCount: selected.length, healthyStationMinimum: RADIO_CATALOG_HEALTHY_MIN_STATIONS };
+  const updatedAt = new Date().toISOString();
+  const stations = selected.map(s => ({ id: s.id, name: s.name, lat: s.lat, lon: s.lon, streamUrl: s.streamUrl, homepage: s.homepage, tags: s.tags, languages: s.languages, state: s.state, country: s.country, countryCode: s.countryCode, metadataTrust: s.metadataTrust, codec: s.codec, bitrate: s.bitrate }));
+
+  if (degraded && _radioCatalog) {
+    // Degraded but have cache: return stale=true with degraded flags (matches original)
+    return { ..._radioCatalog, stale: true, degraded: true, degradedReason: healthReasons.join(','), coverage, acceptedGeneration: null };
+  }
+  if (degraded && !selected.length) throw new Error(`Radio Browser catalog degraded: ${healthReasons.join(',')}`);
+  // Healthy: increment generation
+  _radioGen++;
+  return { stations, updatedAt, stale: false, degraded: false, degradedReason: null, coverage, acceptedGeneration: _radioGen, catalogInstance: _radioCatalogInstance };
+}
+
 async function getRadioCatalog() {
   const now = Date.now();
-  if (_radioCatalog && now - _radioAt < 45 * 60_000) return { ..._radioCatalog, stale: false };
+  if (_radioCatalog && now - Date.parse(_radioCatalog.updatedAt) < RADIO_DIRECTORY_CACHE_MS) return { ..._radioCatalog, stale: false };
   if (!_radioRefreshPromise) {
-    _radioRefreshPromise = buildRadioCatalog().then(catalog => { _radioCatalog = catalog; _radioAt = Date.now(); return catalog; }).finally(() => { _radioRefreshPromise = null; });
+    _radioRefreshPromise = refreshRadioCatalog()
+      .then(catalog => { _radioCatalog = catalog; return catalog; })
+      .catch(err => {
+        if (_radioCatalog && Date.now() - Date.parse(_radioCatalog.updatedAt) <= RADIO_DIRECTORY_STALE_MS) {
+          return { ..._radioCatalog, stale: true, degraded: true, degradedReason: 'refresh-failed' };
+        }
+        throw err;
+      })
+      .finally(() => { _radioRefreshPromise = null; });
   }
-  if (_radioCatalog) return { ..._radioCatalog, stale: true }; // serve stale while refreshing
+  if (_radioCatalog) return { ..._radioCatalog, stale: true }; // stale-while-revalidate
   return _radioRefreshPromise;
 }
 
+const _radioServedIds = new Set();
 async function handleRadio(req, res) {
   const url = qurl(req); const sub = url.pathname.replace(/^\/api\/radio\/?/, '');
 
@@ -723,25 +863,65 @@ async function handleRadio(req, res) {
     if (req.method !== 'GET') return sj(res, 405, { error: 'GET only' });
     try {
       const catalog = await getRadioCatalog();
+      for (const s of catalog.stations) _radioServedIds.add(s.id);
       res.setHeader('Cache-Control', 'no-store');
-      return sj(res, 200, catalog);
-    } catch (err) { return sj(res, 503, { error: 'Radio directory temporarily unavailable', degraded: true, degradedReason: err.message }); }
+      return sj(res, 200, {
+        stations: catalog.stations,
+        updatedAt: catalog.updatedAt,
+        stale: Boolean(catalog.stale),
+        degraded: Boolean(catalog.degraded),
+        degradedReason: catalog.degradedReason || null,
+        coverage: catalog.coverage || null,
+        acceptedGeneration: catalog.acceptedGeneration ?? null,
+        catalogInstance: _radioCatalogInstance,
+      });
+    } catch (err) {
+      return sj(res, 503, { error: 'Radio directory is temporarily unavailable', degraded: Boolean(err?.radioCatalogDegraded), degradedReason: err?.message || null });
+    }
   }
 
   const clickMatch = sub.match(/^click\/([0-9a-f-]+)$/i);
   if (clickMatch) {
     if (req.method !== 'POST') return sj(res, 405, { error: 'POST only' });
-    if (!RADIO_UUID_RE.test(clickMatch[1].toLowerCase())) return sj(res, 404, { error: 'Unknown radio station' });
-    void fetchRadioPath(`/json/url/${clickMatch[1].toLowerCase()}`).catch(() => {});
+    const id = clickMatch[1].toLowerCase();
+    if (!RADIO_UUID_RE.test(id)) return sj(res, 404, { error: 'Unknown radio station' });
+    void fetchRadioPath(`/json/url/${id}`).catch(() => {});
     return res.status(204).end();
   }
 
+  // Forward other paths directly (fallback)
   try {
     const fwdPath = url.pathname.replace(/^\/api\/radio/, '') || '/json/stations/topclick';
-    const r = await fetch(`https://all.api.radio-browser.info${fwdPath}${url.search}`, { headers: { 'User-Agent': 'gods-eye-view/1.0', Accept: 'application/json' }, signal: mkAbort(10_000).signal });
+    const mirrors = await getRadioMirrors();
+    const r = await fetch(`${mirrors[0]}${fwdPath}${url.search}`, { headers: { 'User-Agent': 'gods-eye-view/1.0', Accept: 'application/json' }, signal: mkAbort(10_000).signal });
     res.setHeader('Cache-Control', 'public, max-age=300');
     return sr(res, r.status, Buffer.from(await r.arrayBuffer()), r.headers.get('content-type') || 'application/json');
   } catch (err) { return sj(res, 502, { error: err.message }); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EARTHQUAKES — Proxy USGS with stale cache so transient 502s don't break layer
+// ─────────────────────────────────────────────────────────────────────────────
+let _quakeCache = null, _quakeCacheAt = 0;
+const QUAKE_TTL_MS = 60_000;
+async function handleEarthquakes(req, res) {
+  const now = Date.now();
+  if (_quakeCache && now - _quakeCacheAt < QUAKE_TTL_MS) {
+    res.setHeader('Cache-Control', 'public, max-age=60'); res.setHeader('X-Quake-Cache', 'HIT');
+    return sr(res, 200, _quakeCache, 'application/geo+json');
+  }
+  try {
+    const r = await fetch('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson', { headers: { 'User-Agent': 'gods-eye-view-usgs-proxy/1.0', Accept: 'application/json' }, signal: mkAbort(15_000).signal });
+    if (!r.ok) throw new Error(`USGS HTTP ${r.status}`);
+    const body = await r.text();
+    const parsed = JSON.parse(body); if (!Array.isArray(parsed?.features)) throw new Error('malformed USGS response');
+    _quakeCache = body; _quakeCacheAt = now;
+    res.setHeader('Cache-Control', 'public, max-age=60'); res.setHeader('X-Quake-Cache', 'MISS');
+    return sr(res, 200, body, 'application/geo+json');
+  } catch (err) {
+    if (_quakeCache) { res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Quake-Cache', 'STALE-ERR'); return sr(res, 200, _quakeCache, 'application/geo+json'); }
+    return sj(res, 502, { error: `USGS earthquake proxy error: ${err.message}` });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -750,32 +930,32 @@ async function handleRadio(req, res) {
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.method === 'OPTIONS') return res.status(204).end();
-
   const path = (req.url || '').split('?')[0];
 
-  if (path === '/api/opensky')               return handleOpenSky(req, res);
-  if (path === '/api/opensky-track')         return handleOpenSkyTrack(req, res);
-  if (path === '/api/adsbdb')                return handleAdsbdb(req, res);
-  if (path === '/api/adsblol/mil')           return handleAdsbLolMil(req, res);
-  if (path === '/api/adsblol/trace')         return handleAdsbLolTrace(req, res);
-  if (path.startsWith('/api/celestrak/'))    return handleCelestrak(req, res);
-  if (path === '/api/launches')              return handleLaunches(req, res);
-  if (path === '/api/openai/hud-summary')    return handleHudSummary(req, res);
-  if (path === '/api/realtime/token')        return handleRealtimeToken(req, res);
-  if (path === '/api/realtime/debug-log')    return handleRealtimeDebugLog(req, res);
-  if (path === '/api/google/nearby-places')  return handleNearbyPlaces(req, res);
-  if (path === '/api/google/text-search')    return handleTextSearch(req, res);
-  if (path === '/api/overpass')              return handleOverpass(req, res);
-  if (path === '/api/route')                 return handleRoute(req, res);
-  if (path === '/api/terrain/heights')       return handleTerrainHeights(req, res);
+  if (path === '/api/earthquakes')            return handleEarthquakes(req, res);
+  if (path === '/api/opensky')                return handleOpenSky(req, res);
+  if (path === '/api/opensky-track')          return handleOpenSkyTrack(req, res);
+  if (path === '/api/adsbdb')                 return handleAdsbdb(req, res);
+  if (path === '/api/adsblol/mil')            return handleAdsbLolMil(req, res);
+  if (path === '/api/adsblol/trace')          return handleAdsbLolTrace(req, res);
+  if (path.startsWith('/api/celestrak/'))     return handleCelestrak(req, res);
+  if (path === '/api/launches')               return handleLaunches(req, res);
+  if (path === '/api/openai/hud-summary')     return handleHudSummary(req, res);
+  if (path === '/api/realtime/token')         return handleRealtimeToken(req, res);
+  if (path === '/api/realtime/debug-log')     return handleRealtimeDebugLog(req, res);
+  if (path === '/api/google/nearby-places')   return handleNearbyPlaces(req, res);
+  if (path === '/api/google/text-search')     return handleTextSearch(req, res);
+  if (path === '/api/overpass')               return handleOverpass(req, res);
+  if (path === '/api/route')                  return handleRoute(req, res);
+  if (path === '/api/terrain/heights')        return handleTerrainHeights(req, res);
   if (path === '/api/military-installations') return handleMilitaryInstallations(req, res);
   if (path === '/api/firms' || path.startsWith('/api/firms/')) return handleFirms(req, res);
-  if (path === '/api/regional-brief')        return handleRegionalBrief(req, res);
-  if (path === '/api/weather-effects')       return handleWeatherEffects(req, res);
-  if (path.startsWith('/api/tomtom'))        return handleTomtom(req, res);
+  if (path === '/api/regional-brief')         return handleRegionalBrief(req, res);
+  if (path === '/api/weather-effects')        return handleWeatherEffects(req, res);
+  if (path.startsWith('/api/tomtom'))         return handleTomtom(req, res);
   if (path === '/api/ais-live' || path.startsWith('/api/ais-live/')) return handleAisLive(req, res);
   if (path === '/api/cctv' || path.startsWith('/api/cctv/')) return handleCctv(req, res);
-  if (path.startsWith('/api/gbfs/'))         return handleGbfs(req, res);
+  if (path.startsWith('/api/gbfs/'))          return handleGbfs(req, res);
   if (path === '/api/radio' || path.startsWith('/api/radio/')) return handleRadio(req, res);
 
   return sj(res, 404, { error: `No API handler for ${path}` });
