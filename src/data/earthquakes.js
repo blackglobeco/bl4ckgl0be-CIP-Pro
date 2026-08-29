@@ -217,9 +217,10 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
             material: new Cesium.ColorMaterialProperty(
               color.withAlpha(fillAlpha)
             ),
-            outline: true,
-            outlineColor: color.withAlpha(outlineAlpha),
-            outlineWidth: isSignificant ? 3 : 2,
+            // outline is NOT supported on CLAMP_TO_GROUND ellipses in Cesium —
+            // enabling it triggers "Entity geometry outlines are unsupported on
+            // terrain" warnings and has no visual effect. Disabled here.
+            outline: false,
             heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
           },
           properties: {
