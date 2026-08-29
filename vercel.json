@@ -3,30 +3,6 @@
   "outputDirectory": "dist",
   "framework": null,
   "rewrites": [
-    { "source": "/api/opensky",                        "destination": "/api/aircraft" },
-    { "source": "/api/opensky-track",                  "destination": "/api/aircraft/opensky-track" },
-    { "source": "/api/adsbdb",                         "destination": "/api/aircraft/adsbdb" },
-    { "source": "/api/adsblol/mil",                    "destination": "/api/aircraft/adsblol-mil" },
-    { "source": "/api/adsblol/trace",                  "destination": "/api/aircraft/adsblol-trace" },
-    { "source": "/api/celestrak/:group",               "destination": "/api/satellites/celestrak/:group" },
-    { "source": "/api/launches",                       "destination": "/api/satellites/launches" },
-    { "source": "/api/realtime/token",                 "destination": "/api/openai/realtime-token" },
-    { "source": "/api/realtime/debug-log",             "destination": "/api/openai/debug-log" },
-    { "source": "/api/openai/hud-summary",             "destination": "/api/openai/hud-summary" },
-    { "source": "/api/google/nearby-places",           "destination": "/api/google/nearby-places" },
-    { "source": "/api/google/text-search",             "destination": "/api/google/text-search" },
-    { "source": "/api/overpass",                       "destination": "/api/map/overpass" },
-    { "source": "/api/route",                          "destination": "/api/map/route" },
-    { "source": "/api/terrain/heights",                "destination": "/api/map/terrain-heights" },
-    { "source": "/api/military-installations",         "destination": "/api/map/military-installations" },
-    { "source": "/api/firms/status",                   "destination": "/api/environment/firms-status" },
-    { "source": "/api/firms",                          "destination": "/api/environment/firms" },
-    { "source": "/api/regional-brief",                 "destination": "/api/environment/regional-brief" },
-    { "source": "/api/weather-effects",                "destination": "/api/environment/weather-effects" },
-    { "source": "/api/tomtom/:path*",                  "destination": "/api/traffic/:path*" },
-    { "source": "/api/ais-live",                       "destination": "/api/feeds/ais-live" },
-    { "source": "/api/cctv",                           "destination": "/api/feeds/cctv" },
-    { "source": "/api/gbfs/:path*",                    "destination": "/api/feeds/gbfs/:path*" },
-    { "source": "/api/radio/:path*",                   "destination": "/api/feeds/radio/:path*" }
+    { "source": "/api/:path*", "destination": "/api/index" }
   ]
 }
