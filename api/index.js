@@ -122,16 +122,28 @@ async function handleOpenSky(req, res) {
   const now = Date.now();
   if (_osCache && (now - _osCacheAt < 15_000 || now < _osCooldown)) return sr(res, 200, _osCache, 'application/json');
 
-  const mode = String(process.env.OPENSKY_AUTH_MODE || 'anon').toLowerCase().trim();
+  // Auth mode resolution:
+  // If CLIENT_ID + CLIENT_SECRET are present, ALWAYS use OAuth regardless of
+  // OPENSKY_AUTH_MODE setting. Cloud/Vercel IPs are blocked for anon requests —
+  // OAuth credentials bypass this block. Setting OPENSKY_AUTH_MODE=anon while
+  // also setting CLIENT_ID/SECRET is a common misconfiguration.
+  const cid = process.env.OPENSKY_CLIENT_ID, cs = process.env.OPENSKY_CLIENT_SECRET;
+  const rawMode = String(process.env.OPENSKY_AUTH_MODE || 'auto').toLowerCase().trim();
+  const mode = (cid && cs) ? 'oauth' : rawMode;
+
   const headers = { Accept: 'application/json' }; // original has no User-Agent on main call
-  if (mode === 'oauth' || mode === 'auto') {
+  if (mode === 'oauth') {
     const tok = await getOSToken();
     if (tok) headers.Authorization = `Bearer ${tok}`;
-    else if (mode === 'auto') { const u = process.env.OPENSKY_USERNAME, p = process.env.OPENSKY_PASSWORD; if (u && p) headers.Authorization = `Basic ${b64(`${u}:${p}`)}`; }
+  } else if (mode === 'auto') {
+    const tok = await getOSToken();
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+    else { const u = process.env.OPENSKY_USERNAME, p = process.env.OPENSKY_PASSWORD; if (u && p) headers.Authorization = `Basic ${b64(`${u}:${p}`)}`; }
   } else if (mode === 'basic') {
     const u = process.env.OPENSKY_USERNAME, p = process.env.OPENSKY_PASSWORD;
     if (u && p) headers.Authorization = `Basic ${b64(`${u}:${p}`)}`;
   }
+  // mode === 'anon': no auth — only reached when no CLIENT_ID/SECRET are set
 
   let osErr = null;
   try {
